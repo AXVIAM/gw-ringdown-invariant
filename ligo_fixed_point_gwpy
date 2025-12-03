@@ -1,1 +1,291 @@
+#!/usr/bin/env python3
+"""
+LIGO Informational Fixed-Point Test (GWpy / GWOSC version)
 
+This script:
+  1. Fetches calibrated strain around a GW event using GWpy + GWOSC
+  2. Whitens and band-passes the data
+  3. Crops to a short window around the merger time
+  4. Converts to numpy arrays (t, h)
+  5. Computes first and second derivatives: dh/dt, d2h/dt2
+  6. Builds Xi(t) = |dh/dt| / (|d2h/dt2| + eps)
+  7. Smooths Xi(t)
+  8. Chooses a ringdown window after the peak
+  9. Computes the plateau mean and std
+ 10. Plots and saves the figure
+
+Example:
+    python ligo_fixed_point_gwpy.py --event GW150914 --detector H1 --whiten
+"""
+
+import argparse
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import csv
+
+from gwpy.timeseries import TimeSeries
+from gwosc import datasets
+
+
+# -----------------------------------------------------
+# Helper functions
+# -----------------------------------------------------
+
+def moving_average(x, window):
+    if window <= 1:
+        return x
+    kernel = np.ones(window) / float(window)
+    return np.convolve(x, kernel, mode="same")
+
+
+def compute_derivatives(t, h):
+    dt = t[1] - t[0]
+    dh = np.gradient(h, dt)
+    ddh = np.gradient(dh, dt)
+    return dh, ddh
+
+
+def compute_ratio(dh, ddh, eps_factor=1e-3):
+    abs_ddh = np.abs(ddh)
+    max_ddh = np.max(abs_ddh)
+    if max_ddh == 0:
+        return np.zeros_like(dh)
+    eps = eps_factor * max_ddh
+    Xi = np.abs(dh) / (abs_ddh + eps)
+    return Xi
+
+
+# -----------------------------------------------------
+# Main pipeline
+# -----------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="LIGO fixed-point test (GWpy).")
+    parser.add_argument("--event", type=str, default="GW150914",
+                        help="GWOSC event name (default: GW150914).")
+    parser.add_argument("--detector", type=str, default="H1",
+                        help="Detector: H1, L1, or V1.")
+    parser.add_argument("--fs", type=float, default=4096.0,
+                        help="Sample rate for fetched data.")
+    parser.add_argument("--window", type=float, default=4.0,
+                        help="Length of cropped window around event (seconds).")
+    parser.add_argument("--whiten", action="store_true",
+                        help="Whiten the data before bandpass.")
+    parser.add_argument("--fmin", type=float, default=30.0,
+                        help="Bandpass low frequency.")
+    parser.add_argument("--fmax", type=float, default=400.0,
+                        help="Bandpass high frequency.")
+    parser.add_argument("--smooth-samples", type=int, default=101,
+                        help="Samples for moving-average smoothing.")
+    parser.add_argument("--ringdown-start", type=float, default=0.005,
+                        help="Ringdown start after peak (seconds).")
+    parser.add_argument("--ringdown-end", type=float, default=0.030,
+                        help="Ringdown end after peak (seconds).")
+    args = parser.parse_args()
+
+    # -----------------------------------------------------
+    # 1. Get event GPS time
+    # -----------------------------------------------------
+    t0 = datasets.event_gps(args.event)
+    print(f"[INFO] Event {args.event} GPS time: {t0}")
+
+    half = args.window / 2.0
+    t_start = t0 - half
+    t_end = t0 + half
+
+    # -----------------------------------------------------
+    # 2. Fetch calibrated strain
+    # -----------------------------------------------------
+    print(f"[INFO] Fetching {args.detector} data from {t_start} to {t_end}")
+    strain = TimeSeries.fetch_open_data(
+        args.detector, t_start, t_end, sample_rate=args.fs, cache=False
+    )
+
+    # -----------------------------------------------------
+    # 3. Whitening + bandpass
+    # -----------------------------------------------------
+    if args.whiten:
+        print("[INFO] Whitening data")
+        strain_proc = strain.whiten()
+    else:
+        strain_proc = strain
+
+    print(f"[INFO] Bandpassing {args.fmin}-{args.fmax} Hz")
+    strain_proc = strain_proc.bandpass(args.fmin, args.fmax)
+
+    # Convert to numpy arrays, time relative to t0
+    t = strain_proc.times.value - t0
+    h = strain_proc.value
+
+    # -----------------------------------------------------
+    # 4. Detect merger peak
+    # -----------------------------------------------------
+    idx_peak = np.argmax(np.abs(h))
+    t_peak = t[idx_peak]
+    print(f"[INFO] Peak at t = {t_peak:.6f} s")
+
+    # -----------------------------------------------------
+    # 5. Compute Xi
+    # -----------------------------------------------------
+    dh, ddh = compute_derivatives(t, h)
+    Xi = compute_ratio(dh, ddh)
+    Xi_smooth = moving_average(Xi, args.smooth_samples)
+
+    # -----------------------------------------------------
+    # 6. Ringdown window (relative to peak)
+    # -----------------------------------------------------
+    t0_rd = t_peak + args.ringdown_start
+    t1_rd = t_peak + args.ringdown_end
+    mask_ring = (t >= t0_rd) & (t <= t1_rd)
+
+    if not np.any(mask_ring):
+        raise RuntimeError("Ringdown window does not overlap data.")
+
+    Xi_plateau = Xi_smooth[mask_ring]
+    # Estimate ringdown frequency via zero crossings in ringdown window
+    h_ring = h[mask_ring]
+    t_ring = t[mask_ring]
+    zero_crossings = np.where(np.diff(np.sign(h_ring)))[0]
+    if len(zero_crossings) >= 2:
+        crossing_times = t_ring[zero_crossings]
+        diffs = np.diff(crossing_times)
+        avg_zero_spacing = np.mean(diffs)
+        f_rd = 1.0 / (2.0 * avg_zero_spacing)
+    else:
+        f_rd = np.nan
+
+    plateau_mean = np.mean(Xi_plateau)
+    plateau_std = np.std(Xi_plateau)
+
+    # Compute dimensionless Xi
+    if not np.isnan(f_rd):
+        dimless_xi = (2.0 * np.pi * f_rd) * plateau_mean
+    else:
+        dimless_xi = np.nan
+    print(f"[RESULT] Ringdown window: [{t0_rd:.6f}, {t1_rd:.6f}] s")
+    print(f"[RESULT] Plateau Xi_mean = {plateau_mean:.6e}")
+    print(f"[RESULT] Plateau Xi_std  = {plateau_std:.6e}")
+    print(f"[RESULT] Estimated ringdown freq f_rd = {f_rd:.3f} Hz")
+    print(f"[RESULT] Dimensionless Xi = {dimless_xi:.6e}")
+
+    # -----------------------------------------------------
+    # Noise sanity check: analyze an off-source segment
+    # -----------------------------------------------------
+    print("[INFO] Running off-source noise check")
+    noise_start = t_start - args.window
+    noise_end = t_end - args.window
+
+    try:
+        noise = TimeSeries.fetch_open_data(
+            args.detector, noise_start, noise_end,
+            sample_rate=args.fs, cache=False
+        )
+        if args.whiten:
+            noise_proc = noise.whiten()
+        else:
+            noise_proc = noise
+        noise_proc = noise_proc.bandpass(args.fmin, args.fmax)
+
+        tN = noise_proc.times.value - noise_start
+        hN = noise_proc.value
+
+        dhN, ddhN = compute_derivatives(tN, hN)
+        XiN = compute_ratio(dhN, ddhN)
+        XiN_s = moving_average(XiN, args.smooth_samples)
+
+        # Try to detect a plateau by checking variance reduction
+        var_global = np.var(XiN_s)
+        window_N = XiN_s[int(len(XiN_s)*0.4):int(len(XiN_s)*0.6)]
+        var_window = np.var(window_N)
+
+        if var_window < 0.5 * var_global:
+            print("[NOISE WARNING] Off-source data shows partial plateau-like behavior.")
+        else:
+            print("[NOISE OK] No plateau detected in off-source noise.")
+    except Exception as e:
+        print(f"[NOISE CHECK FAILED] {e}")
+
+    # -----------------------------------------------------
+    # Append results to CSV file
+    # -----------------------------------------------------
+    results_file = "ligo_fixed_point_results.csv"
+    write_header = not os.path.exists(results_file)
+    if write_header:
+        # File does not exist, create and write header line as first row
+        with open(results_file, mode="w", newline="") as f:
+            f.write("event,detector,fs,window,whiten,fmin,fmax,smooth_samples,ringdown_start,ringdown_end,t_peak,t_ring_start,t_ring_end,Xi_mean,Xi_std,Xi_dimensionless\n")
+
+    with open(results_file, mode="a", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow([
+                "event",
+                "detector",
+                "fs",
+                "window",
+                "whiten",
+                "fmin",
+                "fmax",
+                "smooth_samples",
+                "ringdown_start",
+                "ringdown_end",
+                "t_peak",
+                "t_ring_start",
+                "t_ring_end",
+                "Xi_mean",
+                "Xi_std",
+                "Xi_dimensionless"
+            ])
+        writer.writerow([
+            args.event,
+            args.detector,
+            args.fs,
+            args.window,
+            bool(args.whiten),
+            args.fmin,
+            args.fmax,
+            args.smooth_samples,
+            args.ringdown_start,
+            args.ringdown_end,
+            t_peak,
+            t0_rd,
+            t1_rd,
+            plateau_mean,
+            plateau_std,
+            dimless_xi
+        ])
+
+    print(f"[INFO] Appended results to {results_file}")
+
+    # -----------------------------------------------------
+    # 7. Plot and save
+    # -----------------------------------------------------
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+    # Strain
+    ax1.plot(t, h, lw=0.8)
+    ax1.axvline(t_peak, color="r", ls="--", label="Peak")
+    ax1.set_ylabel("Strain h(t)")
+    ax1.set_title(f"{args.event} {args.detector}: strain and Xi(t)")
+    ax1.legend()
+
+    # Xi
+    ax2.plot(t, Xi_smooth, lw=0.8, label="Xi(t) smoothed")
+    ax2.axvspan(t0_rd, t1_rd, alpha=0.3, color="orange")
+    ax2.axhline(plateau_mean, color="k", ls="--",
+                label=f"Plateau mean = {plateau_mean:.3e}")
+    ax2.set_xlabel("Time relative to event (s)")
+    ax2.set_ylabel("Xi(t)")
+    ax2.legend()
+
+    plt.tight_layout()
+
+    outname = f"plot_{args.event}_{args.detector}.png"
+    plt.savefig(outname, dpi=200)
+    print(f"[INFO] Saved plot as {outname}")
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
