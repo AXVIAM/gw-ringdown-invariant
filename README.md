@@ -1,6 +1,6 @@
-# A New Invariant in Gravitational-Wave Ringdown Dynamics
+# Universal Invariant Structure in Black-Hole Ringdown
 Code accompanying the analysis presented in the manuscript  
-**"A New Invariant in Gravitational-Wave Ringdown Dynamics"**  
+**"Universal Invariant Structure in Black-Hole Ringdown"**  
 by Christopher P. B. Smolen (AXVIAM).
 
 This repository contains the complete Python pipeline used to extract a simple, dimensionless invariant from the ringdown phase of binary black-hole mergers using publicly available LIGO strain data.
