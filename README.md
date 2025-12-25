@@ -1,6 +1,6 @@
-# Universal Invariant Structure in Black-Hole Ringdown
+# An Empirical Dimensionless Regularity in Gravitational-Wave Ringdown Dynamics
 Code accompanying the analysis presented in the manuscript  
-**"Universal Invariant Structure in Black-Hole Ringdown"**  
+**"An Empirical Dimensionless Regularity in Gravitational-Wave Ringdown Dynamics"**  
 by Christopher P. B. Smolen (AXVIAM).
 
 This repository contains the complete Python pipeline used to extract a simple, dimensionless invariant from the ringdown phase of binary black-hole mergers using publicly available LIGO strain data.
